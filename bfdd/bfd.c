@@ -374,10 +374,6 @@ int bfd_session_enable(struct bfd_session *bs)
 	struct bfd_vrf_global *bvrf;
 	int psock;
 
-	/* We are using data plane, we don't need software. */
-	if (bs->bdc)
-		return 0;
-
 	/*
 	 * If the interface or VRF doesn't exist, then we must register
 	 * the session but delay its start.
@@ -407,6 +403,20 @@ int bfd_session_enable(struct bfd_session *bs)
 				bs->key.ifname, vrf->name);
 			return 0;
 		}
+	}
+
+	/*
+	 * We are using data plane, we don't need software. The interface or
+	 * VRF may be new, after they were deleted and created again; the
+	 * data plane is told, since it places the session by its interface.
+	 */
+	if (bs->bdc) {
+		if (bs->vrf != vrf || bs->ifp != ifp) {
+			bs->vrf = vrf;
+			bs->ifp = ifp;
+			bfd_dplane_update_session(bs);
+		}
+		return 0;
 	}
 
 	/* Assign interface/VRF pointers. */
