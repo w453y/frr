@@ -215,10 +215,9 @@ This packet will be routed in the topo according to the dst ip 200::A, it will g
 .. note::
 
    Currently some features are not yet implemented:
-   1) SBFD in IPv4 only packet
-   2) The ADMIN DOWN logic
-   3) SBFD echo function in a initiator session
-   4) SBFD over MPLS
+   1) The ADMIN DOWN logic
+   2) SBFD echo function in a initiator session
+   3) SBFD over MPLS
 
 
 .. _sbfd-show:
