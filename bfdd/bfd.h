@@ -418,6 +418,8 @@ struct bfd_session {
 
 	/* software object state */
 	uint8_t polling;
+	/* S-BFD initiator: the reflector polled, the next packet is a Final. */
+	uint8_t sbfd_final;
 
 	/* This and the localDiscr are the keys to state info */
 	struct bfd_key key;
@@ -957,7 +959,7 @@ void sbfd_reflector_flush(void);
 
 /*sbfd*/
 void ptm_sbfd_echo_sess_dn(struct bfd_session *bfd, uint8_t diag);
-void ptm_sbfd_init_sess_dn(struct bfd_session *bfd, uint8_t diag);
+void ptm_sbfd_init_sess_dn(struct bfd_session *bfd, uint8_t diag, bool notify_admin_down);
 void ptm_sbfd_sess_up(struct bfd_session *bfd);
 void sbfd_echo_state_handler(struct bfd_session *bs, int nstate);
 void sbfd_initiator_state_handler(struct bfd_session *bs, int nstate);

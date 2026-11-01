@@ -870,6 +870,27 @@ ssize_t bfd_recv_ipv6(int sd, uint8_t *msgbuf, size_t msgbuflen, uint8_t *ttl,
 	return mlen;
 }
 
+/*
+ * An initiator's transmission interval: one second or more while not Up,
+ * which covers a reflector's AdminDown (RFC 7880, Section 7.3.3); when Up,
+ * the slower of its own Desired Min TX and the reflector's Required Min RX
+ * (RFC 5880, Section 6.8.7), an increase waiting for the Poll Sequence to
+ * end (Section 6.8.3).
+ */
+static void sbfd_init_xmt_update(struct bfd_session *bs)
+{
+	uint64_t xmt_TO = BFD_DEF_SLOWTX;
+
+	if (bs->ses_state == PTM_BFD_UP)
+		xmt_TO = MAX(bs->timers.desired_min_tx, bs->remote_timers.required_min_rx);
+
+	if (xmt_TO == bs->xmt_TO || (bs->polling && xmt_TO > bs->xmt_TO))
+		return;
+
+	bs->xmt_TO = xmt_TO;
+	ptm_bfd_start_xmt_timer(bs, false);
+}
+
 static void bfd_sd_reschedule(struct bfd_vrf_global *bvrf, int sd)
 {
 	if (sd == bvrf->bg_shop) {
@@ -1454,6 +1475,21 @@ void bfd_recv_cb(struct event *t)
 		return;
 	}
 
+	/*
+	 * RFC 7880: an initiator discards a packet with the Demand bit, which
+	 * only an initiator sets (Section 7.3.3); a reflector sends Up or
+	 * AdminDown only (Section 7.3.1).
+	 */
+	if (bfd->bfd_mode == BFD_MODE_TYPE_SBFD_INIT &&
+	    (BFD_GETDEMANDBIT(cp->flags) || (BFD_GETSTATE(cp->flags) != PTM_BFD_UP &&
+					     BFD_GETSTATE(cp->flags) != PTM_BFD_ADM_DOWN))) {
+		cp_debug(is_mhop, &peer, &local, ifindex, vrfid,
+			 "S-BFD reply with Demand bit or state %s",
+			 state_list[BFD_GETSTATE(cp->flags)].str);
+		bfd->stats.rx_bad_ctrl_pkt++;
+		return;
+	}
+
 	/* Save remote diagnostics before state switch. */
 	bfd->remote_diag = CHECK_FLAG(cp->diag, BFD_DIAGMASK);
 
@@ -1474,15 +1510,7 @@ void bfd_recv_cb(struct event *t)
 
 	/* The initiator handle SBFD reflect packet. */
 	if (bfd->bfd_mode == BFD_MODE_TYPE_SBFD_INIT) {
-		sbfd_initiator_state_handler(bfd, PTM_BFD_UP);
-		if (bfd->xmt_TO != bfd->timers.desired_min_tx) {
-			bfd->xmt_TO = bfd->timers.desired_min_tx;
-			//reset xmt timer TO after UP
-			ptm_bfd_start_xmt_timer(bfd, false);
-		}
-
-		bfd->detect_TO = bfd->detect_mult * bfd->xmt_TO;
-		sbfd_init_recvtimer_update(bfd);
+		sbfd_initiator_state_handler(bfd, BFD_GETSTATE(cp->flags));
 
 		if (bfd->polling && BFD_GETFBIT(cp->flags)) {
 			/* Disable polling. */
@@ -1491,6 +1519,18 @@ void bfd_recv_cb(struct event *t)
 			bfd->cur_timers.desired_min_tx = bfd->timers.desired_min_tx;
 			bfd->cur_timers.required_min_rx = bfd->timers.required_min_rx;
 		}
+
+		/*
+		 * RFC 7880, Section 7.5: the reflector's Poll gets a Final in
+		 * the next packet, not in an extra one, which a reflector
+		 * polling every reply would turn into a loop.
+		 */
+		if (BFD_GETPBIT(cp->flags))
+			bfd->sbfd_final = 1;
+
+		sbfd_init_xmt_update(bfd);
+		bfd->detect_TO = bfd->detect_mult * bfd->xmt_TO;
+		sbfd_init_recvtimer_update(bfd);
 
 		return;
 	}

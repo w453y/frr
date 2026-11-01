@@ -321,12 +321,12 @@ static int bfd_session_create(struct nb_cb_create_args *args, bool mhop, uint32_
 			if (bs->key.family == AF_INET6)
 				SET_FLAG(bs->flags, BFD_SESS_FLAG_IPV6);
 
-			if (bfd_mode == BFD_MODE_TYPE_SBFD_ECHO) {
+			/*
+			 * An initiator keeps the slow timers bfd_session_new()
+			 * set until it is Up (RFC 5880, Section 6.8.3).
+			 */
+			if (bfd_mode == BFD_MODE_TYPE_SBFD_ECHO)
 				memcpy(&bs->key.peer, &bs->key.local, sizeof(struct in6_addr));
-			} else {
-				bs->xmt_TO = bs->timers.desired_min_tx;
-				bs->detect_TO = bs->detect_mult * bs->xmt_TO;
-			}
 
 			args->resource->ptr = bs;
 			break;

@@ -928,6 +928,10 @@ void ptm_sbfd_sess_up(struct bfd_session *bfd)
 	/*notify session up*/
 	ptm_bfd_notify(bfd, bfd->ses_state);
 
+	/* Announce the configured timers with a Poll (RFC 5880, Section 6.8.3). */
+	if (bfd->bfd_mode == BFD_MODE_TYPE_SBFD_INIT)
+		bfd_set_polling(bfd);
+
 	if (old_state != bfd->ses_state) {
 		bfd->stats.session_up++;
 		if (bglobal.debug_peer_event)
@@ -939,8 +943,11 @@ void ptm_sbfd_sess_up(struct bfd_session *bfd)
 	}
 }
 
-/*sbfd init session TO */
-void ptm_sbfd_init_sess_dn(struct bfd_session *bfd, uint8_t diag)
+/*
+ * sbfd init session down. A reflector's AdminDown is not a lost path (RFC
+ * 7880, Section 7.3.3): clients are told AdminDown.
+ */
+void ptm_sbfd_init_sess_dn(struct bfd_session *bfd, uint8_t diag, bool notify_admin_down)
 {
 	int old_state = bfd->ses_state;
 
@@ -965,7 +972,7 @@ void ptm_sbfd_init_sess_dn(struct bfd_session *bfd, uint8_t diag)
 
 	/* only signal clients when going from up->down state */
 	if (old_state == PTM_BFD_UP)
-		ptm_bfd_notify(bfd, PTM_BFD_DOWN);
+		ptm_bfd_notify(bfd, notify_admin_down ? PTM_BFD_ADM_DOWN : PTM_BFD_DOWN);
 
 	/* Stop attempting to transmit or expect control packets if passive. */
 	if (CHECK_FLAG(bfd->flags, BFD_SESS_FLAG_PASSIVE)) {
@@ -1069,8 +1076,10 @@ void bfd_echo_xmt_cb(struct event *t)
 void sbfd_init_xmt_cb(struct event *t)
 {
 	struct bfd_session *bs = EVENT_ARG(t);
+	int fbit = bs->sbfd_final;
 
-	ptm_sbfd_init_xmt_TO(bs, 0);
+	bs->sbfd_final = 0;
+	ptm_sbfd_init_xmt_TO(bs, fbit);
 }
 
 void sbfd_echo_xmt_cb(struct event *t)
@@ -1131,7 +1140,7 @@ void sbfd_init_recvtimer_cb(struct event *t)
 	switch (bs->ses_state) {
 	case PTM_BFD_INIT:
 	case PTM_BFD_UP:
-		ptm_sbfd_init_sess_dn(bs, BD_PATH_DOWN);
+		ptm_sbfd_init_sess_dn(bs, BD_PATH_DOWN, false);
 		break;
 
 	default:
@@ -1610,10 +1619,10 @@ static void sbfd_up_handler(struct bfd_session *bs, int nstate)
 	switch (nstate) {
 	case PTM_BFD_ADM_DOWN:
 	case PTM_BFD_DOWN:
-		if (bs->bfd_mode == BFD_MODE_TYPE_SBFD_ECHO) {
+		if (bs->bfd_mode == BFD_MODE_TYPE_SBFD_ECHO)
 			ptm_sbfd_echo_sess_dn(bs, BD_ECHO_FAILED);
-		} else
-			ptm_sbfd_init_sess_dn(bs, BD_ECHO_FAILED);
+		else
+			ptm_sbfd_init_sess_dn(bs, BD_NEIGHBOR_DOWN, nstate == PTM_BFD_ADM_DOWN);
 
 		break;
 
