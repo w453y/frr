@@ -2534,30 +2534,81 @@ void ptm_sbfd_echo_snd(struct bfd_session *bfd)
 		SET_FLAG(bfd->flags, BFD_SESS_FLAG_ECHO_ACTIVE);
 }
 
+/*
+ * RFC 7881, Section 6.1: answer from the address the packet was sent to,
+ * unless it is in 127/8 or ::ffff:127.0.0.0/104, which only label switched
+ * packets carry; the kernel picks one then.
+ */
+static ssize_t bp_sbfd_reflect_send(int sd, const void *buf, size_t len, struct sockaddr_any *peer,
+				    const struct sockaddr_any *local, ifindex_t ifindex)
+{
+	struct iovec iov = { .iov_base = (void *)buf, .iov_len = len };
+	uint8_t cbuf[CMSG_SPACE(sizeof(struct in6_pktinfo))] = {};
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+	struct cmsghdr *cm;
+
+	if (peer->sa_sin.sin_family == AF_INET) {
+		msg.msg_name = &peer->sa_sin;
+		msg.msg_namelen = sizeof(peer->sa_sin);
+#ifdef BFD_LINUX
+		if (local->sa_sin.sin_family == AF_INET &&
+		    (ntohl(local->sa_sin.sin_addr.s_addr) >> 24) != IN_LOOPBACKNET) {
+			struct in_pktinfo *pi;
+
+			msg.msg_control = cbuf;
+			msg.msg_controllen = CMSG_SPACE(sizeof(*pi));
+			cm = CMSG_FIRSTHDR(&msg);
+			cm->cmsg_level = IPPROTO_IP;
+			cm->cmsg_type = IP_PKTINFO;
+			cm->cmsg_len = CMSG_LEN(sizeof(*pi));
+			pi = (struct in_pktinfo *)CMSG_DATA(cm);
+			pi->ipi_spec_dst = local->sa_sin.sin_addr;
+		}
+#endif /* BFD_LINUX */
+	} else {
+		const struct in6_addr *src = &local->sa_sin6.sin6_addr;
+
+		msg.msg_name = &peer->sa_sin6;
+		msg.msg_namelen = sizeof(peer->sa_sin6);
+		if (local->sa_sin6.sin6_family == AF_INET6 &&
+		    !(IN6_IS_ADDR_V4MAPPED(src) && src->s6_addr[12] == IN_LOOPBACKNET)) {
+			struct in6_pktinfo *pi6;
+
+			msg.msg_control = cbuf;
+			msg.msg_controllen = CMSG_SPACE(sizeof(*pi6));
+			cm = CMSG_FIRSTHDR(&msg);
+			cm->cmsg_level = IPPROTO_IPV6;
+			cm->cmsg_type = IPV6_PKTINFO;
+			cm->cmsg_len = CMSG_LEN(sizeof(*pi6));
+			pi6 = (struct in6_pktinfo *)CMSG_DATA(cm);
+			pi6->ipi6_addr = *src;
+			/* A link local source names its interface. */
+			if (IN6_IS_ADDR_LINKLOCAL(src))
+				pi6->ipi6_ifindex = ifindex;
+		}
+	}
+
+	return sendmsg(sd, &msg, 0);
+}
+
 static int ptm_bfd_reflector_process_init_packet(struct bfd_vrf_global *bvrf, int sd)
 {
-	//uint32_t my_discr = 0;
-	//uint32_t remote_discr = 0;
 	uint8_t ttl = 0;
-	struct sockaddr *sa;
-	socklen_t salen;
 	struct sbfd_reflector *sr;
-	/* Receive and parse echo packet. */
 	struct bfd_pkt *cp;
 	ssize_t rlen;
-	struct sockaddr_any local, peer;
+	struct sockaddr_any local = {}, peer = {};
 	ifindex_t ifindex = IFINDEX_INTERNAL;
-	//vrf_id_t vrfid = VRF_DEFAULT;
 	uint8_t msgbuf[BFD_PACKET_SIZE];
+	uint16_t sport;
+	uint8_t flags;
 
 	if (sd == bvrf->bg_initv4) {
 		rlen = bfd_recv_ipv4(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
-		sa = (struct sockaddr *)&peer.sa_sin;
-		salen = sizeof(peer.sa_sin);
+		sport = ntohs(peer.sa_sin.sin_port);
 	} else {
 		rlen = bfd_recv_ipv6(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
-		sa = (struct sockaddr *)&peer.sa_sin6;
-		salen = sizeof(peer.sa_sin6);
+		sport = ntohs(peer.sa_sin6.sin6_port);
 	}
 	if (rlen < 0) {
 		/* bfd_recv_ipv4/v6 already logged the receive error. */
@@ -2568,6 +2619,12 @@ static int ptm_bfd_reflector_process_init_packet(struct bfd_vrf_global *bvrf, in
 		zlog_debug("small bfd packet");
 		return 0;
 	}
+
+	/*
+	 * RFC 7880, Section 7.2: the packet has to be valid as RFC 5880,
+	 * Section 6.8.6 describes. A reflector runs no authentication, so a
+	 * packet with the A bit is discarded too.
+	 */
 	cp = (struct bfd_pkt *)(msgbuf);
 	if (BFD_GETVER(cp->diag) != BFD_VERSION) {
 		zlog_debug("drop sbfd init packet: bad version %u", BFD_GETVER(cp->diag));
@@ -2577,31 +2634,51 @@ static int ptm_bfd_reflector_process_init_packet(struct bfd_vrf_global *bvrf, in
 		zlog_debug("drop sbfd init packet: bad len %u (rx %zd)", cp->len, rlen);
 		return 0;
 	}
-	if (!CHECK_FLAG(cp->flags, BFD_DEMANDBIT)) {
-		/*Control Packet from SBFDInitiator should have Demand bit set to 1 according to RFC7880*/
+	if (cp->detect_mult == 0 || BFD_GETMBIT(cp->flags) || cp->discrs.my_discr == 0 ||
+	    CHECK_FLAG(cp->flags, BFD_ABIT)) {
+		zlog_debug("drop sbfd init packet: invalid (mult %u, flags 0x%02x, my discr %u)",
+			   cp->detect_mult, cp->flags, ntohl(cp->discrs.my_discr));
+		return 0;
+	}
+	/* RFC 7881, Section 6: never from the reflector's own port. */
+	if (sport == BFD_DEF_SBFD_DEST_PORT) {
+		zlog_debug("drop sbfd init packet: source port %u", sport);
+		return 0;
+	}
+	/* RFC 7880, Section 7.2.3: only an initiator sets the Demand bit. */
+	if (!CHECK_FLAG(cp->flags, BFD_DEMANDBIT))
+		return 0;
+
+	sr = sbfd_discr_lookup(ntohl(cp->discrs.remote_discr));
+	if (!sr) {
+		zlog_debug("no reflector found in %u", ntohl(cp->discrs.remote_discr));
 		return 0;
 	}
 
-	sr = sbfd_discr_lookup(ntohl(cp->discrs.remote_discr));
-	if (sr) {
-		uint32_t temp = cp->discrs.my_discr;
+	/*
+	 * RFC 7880, Section 7.2.2: Up, Demand clear, a Final for a Poll;
+	 * Detect Mult and Desired Min TX as received, the discriminators
+	 * swapped. Required Min RX is the shortest interval bfdd takes
+	 * anywhere; no echo is looped back.
+	 */
+	flags = 0;
+	BFD_SETSTATE(flags, PTM_BFD_UP);
+	if (CHECK_FLAG(cp->flags, BFD_PBIT))
+		SET_FLAG(flags, BFD_FBIT);
+	cp->flags = flags;
+	cp->diag = 0;
+	BFD_SETVER(cp->diag, BFD_VERSION);
+	cp->len = BFD_PKT_LEN;
+	cp->discrs.remote_discr = cp->discrs.my_discr;
+	cp->discrs.my_discr = htonl(sr->discr);
+	cp->timers.required_min_rx = htonl(BFD_SBFD_REFLECTOR_MIN_RX);
+	cp->timers.required_min_echo = 0;
 
-		cp->discrs.my_discr = cp->discrs.remote_discr;
-		cp->discrs.remote_discr = temp;
-		UNSET_FLAG(cp->flags, BFD_DEMANDBIT);
-		BFD_SETSTATE(cp->flags, PTM_BFD_UP);
-		if (CHECK_FLAG(cp->flags, BFD_PBIT)) {
-			UNSET_FLAG(cp->flags, BFD_PBIT);
-			SET_FLAG(cp->flags, BFD_FBIT);
-		}
-
-		if (sendto(sd, msgbuf, cp->len, 0, sa, salen) <= 0) {
-			zlog_debug("packet-send: send failure: %s", strerror(errno));
-			return -1;
-		}
-	} else {
-		zlog_debug("no reflector found in %u", cp->discrs.remote_discr);
+	if (bp_sbfd_reflect_send(sd, msgbuf, cp->len, &peer, &local, ifindex) <= 0) {
+		zlog_debug("packet-send: send failure: %s", strerror(errno));
+		return -1;
 	}
+
 	return 0;
 }
 

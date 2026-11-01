@@ -522,6 +522,8 @@ struct sbfd_reflector {
 #define BFD_DEF_ECHO_PORT 3785
 #define BFD_DEF_MHOP_DEST_PORT 4784
 #define BFD_DEF_SBFD_DEST_PORT 7784
+/* S-BFD reflector's Required Min RX: the shortest interval bfdd accepts. */
+#define BFD_SBFD_REFLECTOR_MIN_RX (10 * 1000) /* microseconds. */
 
 #define BFD_SBFD_INITIATOR_DEMAND 1
 
