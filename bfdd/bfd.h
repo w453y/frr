@@ -420,6 +420,10 @@ struct bfd_session {
 	uint8_t polling;
 	/* S-BFD initiator: the reflector polled, the next packet is a Final. */
 	uint8_t sbfd_final;
+	/* S-BFD initiator: its own UDP port and the socket listening there. */
+	uint16_t sbfd_port;
+	int sbfd_rx_sock;
+	struct event *sbfd_rx_ev;
 
 	/* This and the localDiscr are the keys to state info */
 	struct bfd_key key;
@@ -628,6 +632,8 @@ int bp_echo_socket(const struct vrf *vrf);
 int bp_echov6_socket(const struct vrf *vrf);
 int bp_peer_srh_socketv6(struct bfd_session *bs);
 int bp_peer_raw_socketv4(struct bfd_session *bs);
+int bp_sbfd_init_rx_start(struct bfd_session *bs);
+void bp_sbfd_init_rx_stop(struct bfd_session *bs);
 int bp_sbfd_socket(const struct vrf *vrf);
 int bp_initv6_socket(const struct vrf *vrf);
 int bp_initv4_socket(const struct vrf *vrf);

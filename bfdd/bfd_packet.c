@@ -86,8 +86,10 @@ ssize_t bfd_recv_fp_echo(int sd, uint8_t *msgbuf, size_t msgbuflen,
 
 /* socket related prototypes */
 static void bp_set_ipopts(int sd);
+static void bp_set_ip_recvopts(int sd);
 static void bp_bind_ip(int sd, uint16_t port);
 static void bp_set_ipv6opts(int sd);
+static void bp_set_ipv6_recvopts(int sd);
 static void bp_bind_ipv6(int sd, uint16_t port);
 
 /*
@@ -1233,55 +1235,18 @@ static bool bfd_check_auth(struct bfd_session *bfd, const struct bfd_pkt *cp)
 	return true;
 }
 
-void bfd_recv_cb(struct event *t)
+/*
+ * Validate a control packet received on sd and run it through its session.
+ * The addresses are copies the processing may change.
+ */
+static void bfd_recv_ctrl(struct bfd_vrf_global *bvrf, int sd, bool is_mhop, uint8_t *msgbuf,
+			  ssize_t mlen, uint8_t ttl, ifindex_t ifindex, struct sockaddr_any local,
+			  struct sockaddr_any peer)
 {
-	int sd = EVENT_FD(t);
 	struct bfd_session *bfd;
 	struct bfd_pkt *cp;
-	bool is_mhop;
-	ssize_t mlen = 0;
-	uint8_t ttl = 0;
 	vrf_id_t vrfid;
-	ifindex_t ifindex = IFINDEX_INTERNAL;
-	struct sockaddr_any local, peer;
-	uint8_t msgbuf[BFD_PACKET_SIZE];
 	struct interface *ifp = NULL;
-	struct bfd_vrf_global *bvrf = EVENT_ARG(t);
-
-	/* Schedule next read. */
-	bfd_sd_reschedule(bvrf, sd);
-
-	/* The reflector handle SBFD init packets. */
-	if (sd == bvrf->bg_initv6 || sd == bvrf->bg_initv4) {
-		ptm_bfd_reflector_process_init_packet(bvrf, sd);
-		return;
-	}
-	/* Handle echo packets. */
-	if (sd == bvrf->bg_echo || sd == bvrf->bg_echov6) {
-		ptm_bfd_process_echo_pkt(bvrf, sd);
-		return;
-	}
-
-	/* Sanitize input/output. */
-	memset(&local, 0, sizeof(local));
-	memset(&peer, 0, sizeof(peer));
-
-	/* Handle control packets. */
-	is_mhop = false;
-	if (sd == bvrf->bg_shop || sd == bvrf->bg_mhop) {
-		is_mhop = sd == bvrf->bg_mhop;
-		mlen = bfd_recv_ipv4(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex,
-				     &local, &peer);
-	} else if (sd == bvrf->bg_shop6 || sd == bvrf->bg_mhop6) {
-		is_mhop = sd == bvrf->bg_mhop6;
-		mlen = bfd_recv_ipv6(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex,
-				     &local, &peer);
-	}
-
-	if (mlen < 0) {
-		/* bfd_recv_ipv4/v6 already logged the receive error. */
-		return;
-	}
 
 	/*
 	 * With netns backend, we have a separate socket in each VRF. It means
@@ -1589,6 +1554,53 @@ void bfd_recv_cb(struct event *t)
 		/* Send the control packet with the final bit immediately. */
 		ptm_bfd_snd(bfd, 1);
 	}
+}
+
+void bfd_recv_cb(struct event *t)
+{
+	int sd = EVENT_FD(t);
+	bool is_mhop;
+	ssize_t mlen = 0;
+	uint8_t ttl = 0;
+	ifindex_t ifindex = IFINDEX_INTERNAL;
+	struct sockaddr_any local, peer;
+	uint8_t msgbuf[BFD_PACKET_SIZE];
+	struct bfd_vrf_global *bvrf = EVENT_ARG(t);
+
+	/* Schedule next read. */
+	bfd_sd_reschedule(bvrf, sd);
+
+	/* The reflector handle SBFD init packets. */
+	if (sd == bvrf->bg_initv6 || sd == bvrf->bg_initv4) {
+		ptm_bfd_reflector_process_init_packet(bvrf, sd);
+		return;
+	}
+	/* Handle echo packets. */
+	if (sd == bvrf->bg_echo || sd == bvrf->bg_echov6) {
+		ptm_bfd_process_echo_pkt(bvrf, sd);
+		return;
+	}
+
+	/* Sanitize input/output. */
+	memset(&local, 0, sizeof(local));
+	memset(&peer, 0, sizeof(peer));
+
+	/* Handle control packets. */
+	is_mhop = false;
+	if (sd == bvrf->bg_shop || sd == bvrf->bg_mhop) {
+		is_mhop = sd == bvrf->bg_mhop;
+		mlen = bfd_recv_ipv4(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
+	} else if (sd == bvrf->bg_shop6 || sd == bvrf->bg_mhop6) {
+		is_mhop = sd == bvrf->bg_mhop6;
+		mlen = bfd_recv_ipv6(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
+	}
+
+	if (mlen < 0) {
+		/* bfd_recv_ipv4/v6 already logged the receive error. */
+		return;
+	}
+
+	bfd_recv_ctrl(bvrf, sd, is_mhop, msgbuf, mlen, ttl, ifindex, local, peer);
 }
 
 /*
@@ -1903,8 +1915,6 @@ static bool bp_set_reuse_port(int sd)
 
 static void bp_set_ipopts(int sd)
 {
-	int rcvttl = BFD_RCV_TTL_VAL;
-
 	if (!bp_set_reuse_addr(sd))
 		zlog_err("set-reuse-addr: failed");
 
@@ -1913,6 +1923,14 @@ static void bp_set_ipopts(int sd)
 
 	if (bp_set_ttl(sd, BFD_TTL_VAL) != 0)
 		zlog_err("set-ipopts: TTL configuration failed");
+
+	bp_set_ip_recvopts(sd);
+}
+
+/* What bfd_recv_ipv4() reads besides the packet: TTL, address, interface. */
+static void bp_set_ip_recvopts(int sd)
+{
+	int rcvttl = BFD_RCV_TTL_VAL;
 
 	if (setsockopt(sd, IPPROTO_IP, IP_RECVTTL, &rcvttl, sizeof(rcvttl))
 	    == -1)
@@ -2165,9 +2183,6 @@ int bp_set_tosv6(int sd, uint8_t value)
 
 static void bp_set_ipv6opts(int sd)
 {
-	int ipv6_pktinfo = BFD_IPV6_PKT_INFO_VAL;
-	int ipv6_only = BFD_IPV6_ONLY_VAL;
-
 	if (!bp_set_reuse_addr(sd))
 		zlog_err("set-reuse-addr: failed");
 
@@ -2177,6 +2192,15 @@ static void bp_set_ipv6opts(int sd)
 	if (bp_set_ttlv6(sd, BFD_TTL_VAL) == -1)
 		zlog_err("set-ipv6opts: setsockopt(IPV6_UNICAST_HOPS, %d): %s", BFD_TTL_VAL,
 			 strerror(errno));
+
+	bp_set_ipv6_recvopts(sd);
+}
+
+/* What bfd_recv_ipv6() reads besides the packet: hop limit, address, interface. */
+static void bp_set_ipv6_recvopts(int sd)
+{
+	int ipv6_pktinfo = BFD_IPV6_PKT_INFO_VAL;
+	int ipv6_only = BFD_IPV6_ONLY_VAL;
 
 	if (setsockopt_ipv6_hoplimit(sd, BFD_RCV_TTL_VAL) == -1)
 		zlog_err("set-ipv6opts: setsockopt(IPV6_HOPLIMIT, %d): %s", BFD_RCV_TTL_VAL,
@@ -2424,12 +2448,10 @@ int _ptm_sbfd_init_send(struct bfd_session *bfd, const void *data, size_t datale
 	local = bfd->key.local;
 	peer = bfd->key.peer;
 
-	/*SBFD Control pkt dst port should be 7784, src port can be any but NOT 7784 according to RFC7881 */
+	/* To port 7784, from the session's own (RFC 7881, Section 2). */
 	if (bp_raw_sbfd_red_send(sd, (uint8_t *)data, datalen, bfd->key.family, &bfd->out_sip6,
-				 &local, &peer,
-				 CHECK_FLAG(bfd->flags, BFD_SESS_FLAG_MH) ? BFD_DEF_MHOP_DEST_PORT
-									  : BFD_DEFDESTPORT,
-				 BFD_DEF_SBFD_DEST_PORT, seg_num, segment_list) < 0) {
+				 &local, &peer, bfd->sbfd_port, BFD_DEF_SBFD_DEST_PORT, seg_num,
+				 segment_list) < 0) {
 		if (bfd->stats.tx_fail_pkt <= 1) {
 			char dst[INET6_ADDRSTRLEN] = { 0 };
 
@@ -2772,6 +2794,108 @@ int bp_peer_srh_socketv6(struct bfd_session *bs)
 	}
 
 	return sd;
+}
+
+static void sbfd_init_recv_cb(struct event *t)
+{
+	struct bfd_session *bs = EVENT_ARG(t);
+	int sd = EVENT_FD(t);
+	struct bfd_vrf_global *bvrf;
+	struct sockaddr_any local = {}, peer = {};
+	ifindex_t ifindex = IFINDEX_INTERNAL;
+	uint8_t msgbuf[BFD_PACKET_SIZE];
+	uint8_t ttl = 0;
+	ssize_t mlen;
+
+	event_add_read(master, sbfd_init_recv_cb, bs, sd, &bs->sbfd_rx_ev);
+
+	if (bs->key.family == AF_INET)
+		mlen = bfd_recv_ipv4(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
+	else
+		mlen = bfd_recv_ipv6(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
+	if (mlen < 0)
+		return;
+
+	bvrf = bfd_vrf_look_by_session(bs);
+	if (!bvrf)
+		return;
+
+	bfd_recv_ctrl(bvrf, sd, CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH), msgbuf, mlen, ttl,
+		      ifindex, local, peer);
+}
+
+/*
+ * An S-BFD initiator sends from a UDP port of its own, the same for all its
+ * packets and held by no other initiator, and listens there for the
+ * reflected ones (RFC 7881, Section 2). The kernel picks one no socket holds;
+ * 7784 is never one.
+ */
+int bp_sbfd_init_rx_start(struct bfd_session *bs)
+{
+	const char *device_to_bind = NULL;
+	struct sockaddr_any sa = {};
+	socklen_t salen;
+	int sd = -1;
+	int tries;
+
+	if (bs->key.ifname[0])
+		device_to_bind = (const char *)bs->key.ifname;
+	else if (CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH) && bs->key.vrfname[0])
+		device_to_bind = (const char *)bs->key.vrfname;
+
+	for (tries = 0; tries < 3; tries++) {
+		frr_with_privs (&bglobal.bfdd_privs) {
+			sd = vrf_socket(bs->key.family, SOCK_DGRAM, 0, bs->vrf->vrf_id,
+					device_to_bind);
+		}
+		if (sd == -1) {
+			zlog_err("sbfd-init-socket: socket: %s", strerror(errno));
+			return -1;
+		}
+
+		memset(&sa, 0, sizeof(sa));
+		if (bs->key.family == AF_INET) {
+			bp_set_ip_recvopts(sd);
+			sa.sa_sin.sin_family = AF_INET;
+			salen = sizeof(sa.sa_sin);
+		} else {
+			bp_set_ipv6_recvopts(sd);
+			sa.sa_sin6.sin6_family = AF_INET6;
+			salen = sizeof(sa.sa_sin6);
+		}
+		if (bind(sd, (struct sockaddr *)&sa, salen) == -1 ||
+		    getsockname(sd, (struct sockaddr *)&sa, &salen) == -1) {
+			zlog_err("sbfd-init-socket: bind: %s", strerror(errno));
+			close(sd);
+			return -1;
+		}
+
+		bs->sbfd_port = ntohs(bs->key.family == AF_INET ? sa.sa_sin.sin_port
+								: sa.sa_sin6.sin6_port);
+		if (bs->sbfd_port != BFD_DEF_SBFD_DEST_PORT)
+			break;
+		close(sd);
+		sd = -1;
+	}
+	if (sd == -1) {
+		zlog_err("sbfd-init-socket: no port other than %u", BFD_DEF_SBFD_DEST_PORT);
+		return -1;
+	}
+
+	bs->sbfd_rx_sock = sd;
+	event_add_read(master, sbfd_init_recv_cb, bs, sd, &bs->sbfd_rx_ev);
+
+	return 0;
+}
+
+void bp_sbfd_init_rx_stop(struct bfd_session *bs)
+{
+	event_cancel(&bs->sbfd_rx_ev);
+	if (bs->sbfd_rx_sock != -1) {
+		close(bs->sbfd_rx_sock);
+		bs->sbfd_rx_sock = -1;
+	}
+	bs->sbfd_port = 0;
 }
 
 int bp_initv4_socket(const struct vrf *vrf)

@@ -440,6 +440,7 @@ int bfd_session_enable(struct bfd_session *bs)
 		close(bs->sock);
 		bs->sock = -1;
 	}
+	bp_sbfd_init_rx_stop(bs);
 
 	/*
 	 * Get socket for transmitting control packets.  Note that if we
@@ -473,6 +474,11 @@ int bfd_session_enable(struct bfd_session *bs)
 			zlog_err("bp_peer_socketv6 error");
 			return 0;
 		}
+	}
+
+	if (bs->bfd_mode == BFD_MODE_TYPE_SBFD_INIT && bp_sbfd_init_rx_start(bs) != 0) {
+		close(psock);
+		return 0;
 	}
 
 	/*
@@ -556,6 +562,7 @@ void bfd_session_disable(struct bfd_session *bs)
 		close(bs->sock);
 		bs->sock = -1;
 	}
+	bp_sbfd_init_rx_stop(bs);
 
 	/* Disable all timers. */
 	bfd_recvtimer_delete(bs);
@@ -1201,6 +1208,7 @@ struct bfd_session *bfd_session_new(enum bfd_mode_type mode)
 	bs->remote_detect_mult = BFD_DEFDETECTMULT;
 
 	bs->sock = -1;
+	bs->sbfd_rx_sock = -1;
 	monotime(&bs->uptime);
 	bs->downtime = bs->uptime;
 
