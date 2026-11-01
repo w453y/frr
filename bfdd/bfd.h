@@ -538,9 +538,10 @@ struct bfd_vrf_global {
 	int bg_echo;
 	int bg_echov6;
 	int bg_initv6;
+	int bg_initv4;
 	struct vrf *vrf;
 
-	struct event *bg_ev[7];
+	struct event *bg_ev[8];
 
 	/** Number of active BFD sessions using this VRF's sockets. */
 	unsigned int bg_session_count;
@@ -622,8 +623,10 @@ int bp_peer_socketv6(const struct bfd_session *bs);
 int bp_echo_socket(const struct vrf *vrf);
 int bp_echov6_socket(const struct vrf *vrf);
 int bp_peer_srh_socketv6(struct bfd_session *bs);
+int bp_peer_raw_socketv4(struct bfd_session *bs);
 int bp_sbfd_socket(const struct vrf *vrf);
 int bp_initv6_socket(const struct vrf *vrf);
+int bp_initv4_socket(const struct vrf *vrf);
 
 void ptm_bfd_snd(struct bfd_session *bfd, int fbit);
 void ptm_bfd_echo_snd(struct bfd_session *bfd);

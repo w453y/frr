@@ -446,7 +446,16 @@ int bfd_session_enable(struct bfd_session *bs)
 	 * could use the destination port (3784) for the source
 	 * port we wouldn't need a socket per session.
 	 */
-	if (bs->bfd_mode == BFD_MODE_TYPE_SBFD_ECHO || bs->bfd_mode == BFD_MODE_TYPE_SBFD_INIT) {
+	if (bs->bfd_mode == BFD_MODE_TYPE_SBFD_INIT && bs->key.family == AF_INET &&
+	    bs->segnum == 0) {
+		/* IPv4 with no SRv6 encapsulation: no IPv6 header to send it in. */
+		psock = bp_peer_raw_socketv4(bs);
+		if (psock < 0) {
+			zlog_err("bp_peer_raw_socketv4 error");
+			return 0;
+		}
+	} else if (bs->bfd_mode == BFD_MODE_TYPE_SBFD_ECHO ||
+		   bs->bfd_mode == BFD_MODE_TYPE_SBFD_INIT) {
 		psock = bp_peer_srh_socketv6(bs);
 		if (psock < 0) {
 			zlog_err("bp_peer_srh_socketv6 error");
@@ -2822,6 +2831,7 @@ static int bfd_vrf_new(struct vrf *vrf)
 	bvrf->bg_echo = -1;
 	bvrf->bg_echov6 = -1;
 	bvrf->bg_initv6 = -1;
+	bvrf->bg_initv4 = -1;
 
 	return 0;
 }
@@ -3062,6 +3072,8 @@ int bfd_vrf_start_sockets(struct bfd_vrf_global *bvrf)
 		bvrf->bg_mhop6 = bp_udp6_mhop(bvrf->vrf);
 	if (bvrf->bg_initv6 == -1)
 		bvrf->bg_initv6 = bp_initv6_socket(bvrf->vrf);
+	if (bvrf->bg_initv4 == -1)
+		bvrf->bg_initv4 = bp_initv4_socket(bvrf->vrf);
 
 	if (!event_is_scheduled(bvrf->bg_ev[0]) && bvrf->bg_shop != -1)
 		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_shop,
@@ -3078,6 +3090,8 @@ int bfd_vrf_start_sockets(struct bfd_vrf_global *bvrf)
 	if (!event_is_scheduled(bvrf->bg_ev[6]) && bvrf->bg_initv6 != -1)
 		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_initv6,
 			       &bvrf->bg_ev[6]);
+	if (!event_is_scheduled(bvrf->bg_ev[7]) && bvrf->bg_initv4 != -1)
+		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_initv4, &bvrf->bg_ev[7]);
 
 	/* Open echo sockets if any session in this VRF uses echo mode. */
 	bfd_vrf_toggle_echo(bvrf);
@@ -3105,6 +3119,7 @@ void bfd_vrf_stop_sockets(struct bfd_vrf_global *bvrf)
 	event_cancel(&bvrf->bg_ev[4]);
 	event_cancel(&bvrf->bg_ev[5]);
 	event_cancel(&bvrf->bg_ev[6]);
+	event_cancel(&bvrf->bg_ev[7]);
 
 	/* Close all descriptors. */
 	socket_close(&bvrf->bg_echo);
@@ -3114,4 +3129,5 @@ void bfd_vrf_stop_sockets(struct bfd_vrf_global *bvrf)
 	socket_close(&bvrf->bg_mhop6);
 	socket_close(&bvrf->bg_echov6);
 	socket_close(&bvrf->bg_initv6);
+	socket_close(&bvrf->bg_initv4);
 }

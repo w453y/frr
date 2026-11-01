@@ -899,6 +899,9 @@ static void bfd_sd_reschedule(struct bfd_vrf_global *bvrf, int sd)
 	} else if (sd == bvrf->bg_initv6) {
 		event_cancel(&bvrf->bg_ev[6]);
 		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_initv6, &bvrf->bg_ev[6]);
+	} else if (sd == bvrf->bg_initv4) {
+		event_cancel(&bvrf->bg_ev[7]);
+		event_add_read(master, bfd_recv_cb, bvrf, bvrf->bg_initv4, &bvrf->bg_ev[7]);
 	}
 }
 
@@ -1228,7 +1231,7 @@ void bfd_recv_cb(struct event *t)
 	bfd_sd_reschedule(bvrf, sd);
 
 	/* The reflector handle SBFD init packets. */
-	if (sd == bvrf->bg_initv6) {
+	if (sd == bvrf->bg_initv6 || sd == bvrf->bg_initv4) {
 		ptm_bfd_reflector_process_init_packet(bvrf, sd);
 		return;
 	}
@@ -2365,6 +2368,7 @@ int _ptm_sbfd_init_send(struct bfd_session *bfd, const void *data, size_t datale
 	struct in6_addr *segment_list = NULL;
 	struct in6_addr peer;
 	struct in6_addr local;
+	int dst_af;
 
 	if (!bvrf)
 		return -1;
@@ -2372,6 +2376,8 @@ int _ptm_sbfd_init_send(struct bfd_session *bfd, const void *data, size_t datale
 	seg_num = bfd->segnum;
 	if (seg_num > 0)
 		segment_list = bfd->seg_list;
+	/* The first segment, else the peer. */
+	dst_af = seg_num > 0 ? AF_INET6 : bfd->key.family;
 
 	sd = bfd->sock;
 
@@ -2387,7 +2393,7 @@ int _ptm_sbfd_init_send(struct bfd_session *bfd, const void *data, size_t datale
 		if (bfd->stats.tx_fail_pkt <= 1) {
 			char dst[INET6_ADDRSTRLEN] = { 0 };
 
-			inet_ntop(AF_INET6, seg_num > 0 ? segment_list : (&bfd->key.peer), dst,
+			inet_ntop(dst_af, seg_num > 0 ? segment_list : (&bfd->key.peer), dst,
 				  sizeof(dst));
 			zlog_err("sbfd initiator send failed, dst:%s, errno:%s", dst,
 				 safe_strerror(errno));
@@ -2400,7 +2406,7 @@ int _ptm_sbfd_init_send(struct bfd_session *bfd, const void *data, size_t datale
 	if (bfd->stats.tx_fail_pkt > 0) {
 		char dst[INET6_ADDRSTRLEN] = { 0 };
 
-		inet_ntop(AF_INET6, seg_num > 0 ? segment_list : (&bfd->key.peer), dst, sizeof(dst));
+		inet_ntop(dst_af, seg_num > 0 ? segment_list : (&bfd->key.peer), dst, sizeof(dst));
 		zlog_warn("sbfd initiator send success, dst:%s, previous tx_fail_pkt:%d", dst,
 			  (int)bfd->stats.tx_fail_pkt);
 	}
@@ -2534,6 +2540,7 @@ static int ptm_bfd_reflector_process_init_packet(struct bfd_vrf_global *bvrf, in
 	//uint32_t remote_discr = 0;
 	uint8_t ttl = 0;
 	struct sockaddr *sa;
+	socklen_t salen;
 	struct sbfd_reflector *sr;
 	/* Receive and parse echo packet. */
 	struct bfd_pkt *cp;
@@ -2543,9 +2550,17 @@ static int ptm_bfd_reflector_process_init_packet(struct bfd_vrf_global *bvrf, in
 	//vrf_id_t vrfid = VRF_DEFAULT;
 	uint8_t msgbuf[BFD_PACKET_SIZE];
 
-	rlen = bfd_recv_ipv6(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
+	if (sd == bvrf->bg_initv4) {
+		rlen = bfd_recv_ipv4(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
+		sa = (struct sockaddr *)&peer.sa_sin;
+		salen = sizeof(peer.sa_sin);
+	} else {
+		rlen = bfd_recv_ipv6(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex, &local, &peer);
+		sa = (struct sockaddr *)&peer.sa_sin6;
+		salen = sizeof(peer.sa_sin6);
+	}
 	if (rlen < 0) {
-		/* bfd_recv_ipv6 already logged the receive error. */
+		/* bfd_recv_ipv4/v6 already logged the receive error. */
 		return 0;
 	}
 	/* Short packet, better not risk reading it. */
@@ -2580,9 +2595,7 @@ static int ptm_bfd_reflector_process_init_packet(struct bfd_vrf_global *bvrf, in
 			SET_FLAG(cp->flags, BFD_FBIT);
 		}
 
-		sa = (struct sockaddr *)&peer.sa_sin6;
-
-		if (sendto(sd, msgbuf, cp->len, 0, sa, sizeof(peer.sa_sin6)) <= 0) {
+		if (sendto(sd, msgbuf, cp->len, 0, sa, salen) <= 0) {
 			zlog_debug("packet-send: send failure: %s", strerror(errno));
 			return -1;
 		}
@@ -2638,6 +2651,47 @@ int bp_peer_srh_socketv6(struct bfd_session *bs)
 #endif
 		zlog_err("setsockopt IPV6_HDRINCL error: %s", strerror(errno));
 		close(sd);
+		return -1;
+	}
+
+	return sd;
+}
+
+int bp_initv4_socket(const struct vrf *vrf)
+{
+	int sd;
+
+	frr_with_privs (&bglobal.bfdd_privs) {
+		sd = vrf_socket(AF_INET, SOCK_DGRAM, PF_UNSPEC, vrf->vrf_id, vrf->name);
+	}
+	if (sd == -1) {
+		zlog_err("sbfd-reflector-socket: socket: %s", strerror(errno));
+		return -1;
+	}
+
+	bp_set_ipopts(sd);
+	bp_bind_ip(sd, BFD_DEF_SBFD_DEST_PORT);
+
+	return sd;
+}
+
+/* An S-BFD initiator's IPv4 packets, headers included. */
+int bp_peer_raw_socketv4(struct bfd_session *bs)
+{
+	const char *device_to_bind = NULL;
+	int sd;
+
+	if (bs->key.ifname[0])
+		device_to_bind = (const char *)bs->key.ifname;
+	else if (CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH) && bs->key.vrfname[0])
+		device_to_bind = (const char *)bs->key.vrfname;
+
+	/* IPPROTO_RAW implies IP_HDRINCL. */
+	frr_with_privs (&bglobal.bfdd_privs) {
+		sd = vrf_socket(AF_INET, SOCK_RAW, IPPROTO_RAW, bs->vrf->vrf_id, device_to_bind);
+	}
+	if (sd == -1) {
+		zlog_err("ipv4-new: failed to create socket: %s", strerror(errno));
 		return -1;
 	}
 
@@ -3003,6 +3057,7 @@ static int bp_raw_sbfd_red_send(int sd, uint8_t *data, size_t datalen, uint16_t 
 
 	struct ipaddr out_sip_addr = { 0 };
 	struct sockaddr_in6 dst_sin6 = { 0 };
+	struct sockaddr_in dst_sin = { 0 };
 	char buf_addr[INET6_ADDRSTRLEN] = { 0 };
 
 	memset(sendbuf, 0, sizeof(sendbuf));
@@ -3041,12 +3096,7 @@ static int bp_raw_sbfd_red_send(int sd, uint8_t *data, size_t datalen, uint16_t 
 		bp_sbfd_encap_udp6(udp, ip6h, src_port, dst_port, data, datalen);
 		total_len += sizeof(struct udphdr);
 	} else {
-		if (seg_num == 0) {
-			//should never come to here, just print a error hint
-			zlog_err("%s error, empty sidlist for ipv4 bfd", __func__);
-		}
-
-		/* Inner IPv4 Header */
+		/* Inner IPv4 header, or the only one without a segment list. */
 		iph = (struct ip *)(sendbuf + total_len);
 		bp_sbfd_encap_inner_iph(iph, sip, dip, datalen);
 		total_len += sizeof(struct ip);
@@ -3071,15 +3121,25 @@ static int bp_raw_sbfd_red_send(int sd, uint8_t *data, size_t datalen, uint16_t 
 	iov.iov_base = (uint8_t *)sendbuf;
 	iov.iov_len = total_len;
 
-	msg.msg_name = &dst_sin6;
-	msg.msg_namelen = sizeof(struct sockaddr_in6);
+	if (family == AF_INET && seg_num == 0) {
+		dst_sin.sin_family = AF_INET;
+		memcpy(&dst_sin.sin_addr, dip, sizeof(dst_sin.sin_addr));
+		msg.msg_name = &dst_sin;
+		msg.msg_namelen = sizeof(dst_sin);
+	} else {
+		msg.msg_name = &dst_sin6;
+		msg.msg_namelen = sizeof(struct sockaddr_in6);
+	}
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
 
 	/* sendmsg */
 	ret = sendmsg(sd, &msg, flags);
 	if (ret < 0) {
-		inet_ntop(AF_INET6, &dst_sin6.sin6_addr, buf_addr, INET6_ADDRSTRLEN);
+		if (msg.msg_name == &dst_sin)
+			inet_ntop(AF_INET, &dst_sin.sin_addr, buf_addr, sizeof(buf_addr));
+		else
+			inet_ntop(AF_INET6, &dst_sin6.sin6_addr, buf_addr, sizeof(buf_addr));
 		zlog_debug("sbfd send to:%s failed , ret:%d, errno:%s", buf_addr, ret,
 			   safe_strerror(errno));
 
