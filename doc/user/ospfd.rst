@@ -916,6 +916,11 @@ a BFD profile to these sessions.
    net.ipv4.conf.<interface name>.rp_filter value to 0.  In order for
    the ospf multicast packets to be delivered by the kernel.
 
+   For an address with a peer, such as ``ip address 10.0.0.1 peer
+   10.0.0.2/30`` or a tunnel address on FreeBSD, the prefix length of the
+   peer is used instead: the interface is `unnumbered` only when the peer
+   is a /32.
+
    When used in a DMVPN network at a spoke, this OSPF will be configured in
    point-to-point, but the HUB will be a point-to-multipoint. To make this
    topology work, specify the optional 'dmvpn' parameter at the spoke.

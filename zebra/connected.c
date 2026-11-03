@@ -60,7 +60,15 @@ static void connected_announce(struct interface *ifp, struct connected *ifc)
 		return;
 
 	if (!if_is_loopback(ifp) && ifc->address->family == AF_INET) {
-		if (ifc->address->prefixlen == IPV4_MAX_BITLEN)
+		/*
+		 * With a peer address the local address is always stored as a
+		 * /32 and the subnet length is on the destination, so look at
+		 * that one: "10.0.0.1 peer 10.0.0.2/30" is a numbered link,
+		 * "10.0.0.1 peer 10.0.0.2/32" is not.
+		 */
+		const struct prefix *p = CONNECTED_PREFIX(ifc);
+
+		if (p->prefixlen == IPV4_MAX_BITLEN)
 			SET_FLAG(ifc->flags, ZEBRA_IFA_UNNUMBERED);
 		else
 			UNSET_FLAG(ifc->flags, ZEBRA_IFA_UNNUMBERED);
