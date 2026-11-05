@@ -226,8 +226,7 @@ static int kernel_rtm(int cmd, const struct prefix *p,
 					/* Drop the ifindex set for the kernel */
 					if (IN6_IS_ADDR_LINKLOCAL(&addr))
 						SET_IN6_LINKLOCAL_IFINDEX(addr, 0);
-					inet_ntop(AF_INET6, &addr, gate_buf,
-						  sizeof(gate_buf));
+					inet_ntop(AF_INET6, &addr, gate_buf, sizeof(gate_buf));
 				} break;
 
 				default:
